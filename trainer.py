@@ -20,6 +20,40 @@ from dataloader import make_data
 # from unet_model.unet_model import UNetModel
 from model import AAUNet
 from help_functions import convertToNumpy, calculateDiceScore, calculateDiceLoss
+
+import torch
+import torch.nn.functional as F
+from skimage.morphology import dilation, disk
+
+import numpy as np
+from skimage.morphology import dilation, disk
+
+
+def get_gt_boundary_np(gt, radius=2):
+    """
+    输入: gt: N×H×W，numpy array, 0-1 掩码图
+    输出: bnd: N×H×W，边界图（值为0或1）
+    """
+    if isinstance(gt, torch.Tensor):
+        gt = gt.detach().cpu().numpy()
+
+    gt = (gt > 0).astype(np.uint8)
+    bnd = np.zeros_like(gt, dtype=np.uint8)
+    selem = disk(radius)
+
+    for i in range(gt.shape[0]):
+        _mask = gt[i]
+        if _mask.ndim != 2 or _mask.max() == 0:
+            continue  # 跳过非二维图像或全背景图
+        try:
+            _gt_dil = dilation(_mask, selem)
+            bnd[i] = ((_gt_dil - _mask) == 1).astype(np.uint8)
+        except Exception as e:
+            print(f"[Warning] Error processing slice {i}: {e}")
+            continue
+    return bnd
+
+
 # 评价指标===========================================
 def calculateJaccard(pred, target):
     smooth = 1e-6
@@ -100,12 +134,7 @@ def trainModel(model, train_loader, val_loader, lr, num_epochs,
                               weight_decay=weight_decay, momentum=momentum,
                               )
 
-    # Initialize logging
-    # experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
-    # experiment.config.update(
-    #     dict(num_epochs=num_epochs, batch_size=args.batch_size, learning_rate=lr,
-    #          val_size=args.val_size, save_checkpoint=save_checkpoint)
-    # )
+
 
     logging.info(f'''Training & validation loop started:
         Epochs:          {num_epochs}
@@ -132,11 +161,6 @@ def trainModel(model, train_loader, val_loader, lr, num_epochs,
     total_val_samples = 0
     best_dice = 0.0
 
-    # total_train_samples = sum(images.size(0) for images, _, _ in train_loader)
-    # logging.info(f"Total Train Samples = {total_train_samples}")
-    #
-    # total_val_samples = sum(images.size(0) for images, _, _ in val_loader)
-    # logging.info(f"Total Validation Samples = {total_val_samples}")
 
     for epoch in range(num_epochs):
 
@@ -145,30 +169,40 @@ def trainModel(model, train_loader, val_loader, lr, num_epochs,
         train_dice_loss = 0.0
         train_dice_score = 0.0
 
+
         weight_bce = 0.7  # BCE 或 CrossEntropy 的权重
         weight_dice = 0.3
 
         for images, true_masks in train_loader:
-            # print(f"Input tensor type: {images.dtype}, shape: {images.shape}")
-            # print(f"Mask tensor type: {true_masks.dtype}, shape: {true_masks.shape}")
-            # # 检查图像和掩码是否已经归一化
-            # print(f"Image min: {images.min().item()}, max: {images.max().item()}")
-            # print(f"Mask min: {true_masks.min().item()}, max: {true_masks.max().item()}")
-            # # 检查掩码的唯一值
-            # unique_values = torch.unique(true_masks)
-            # print(f" Unique mask values: {unique_values.tolist()}")
+
             images, true_masks = images.to(device), true_masks.to(device)
             if true_masks.dim() == 3:  # 如果掩码没有通道维度
                 true_masks = true_masks.unsqueeze(1)
             optimizer.zero_grad()
-            pred_masks = model(images)
-            # 这里model输出的是未经激活函数激活过的。---------------------------------
-            pred_binary = (torch.sigmoid(pred_masks) > 0.5).float()
-            # pred_binary = torch.where(torch.sigmoid(pred_masks) > 0.5, 1.0, 0.0)
 
-            bce_loss = criterion(pred_masks, true_masks)  # BCE 或 CrossEntropy 损失
-            dice_loss = calculateDiceLoss(torch.sigmoid(pred_masks), true_masks)  # Dice 损失
-            loss = weight_bce * bce_loss + weight_dice * dice_loss  # 加权损失
+            pred_main, pred_aux, edge_att = model(images)
+            # 这里model输出的是未经激活函数激活过的。---------------------------------
+            pred_binary = (torch.sigmoid(pred_main) > 0.5).float()
+
+            # Dice + BCE for main
+            bce_main = criterion(pred_main, true_masks)
+            dice_main = calculateDiceLoss(torch.sigmoid(pred_main), true_masks)
+
+            # Dice + BCE for auxiliary
+            bce_aux = criterion(pred_aux, true_masks)
+            dice_aux = calculateDiceLoss(torch.sigmoid(pred_aux), true_masks)
+            # 从 GT 掩码生成边界图 (输入为 tensor，需先转 numpy 后转回)
+            with torch.no_grad():
+                # gt_np = true_masks.detach().cpu().numpy()
+                gt_np = true_masks.squeeze(1).detach().cpu().numpy()
+                gt_bnd_np = get_gt_boundary_np(gt_np, radius=2)
+            gt_bnd = torch.from_numpy(gt_bnd_np).float().unsqueeze(1).to(true_masks.device)
+
+            # 使用 BCE 或 Dice 损失监督边界注意力图
+            edge_loss = F.binary_cross_entropy(edge_att, gt_bnd)
+
+            # 权重设置（建议主分支 1.0，辅助 0.4）
+            loss = (0.7 * bce_main + 0.3 * dice_main) + 0.4 * (0.7 * bce_aux + 0.3 * dice_aux) + 0.1 * edge_loss
             # 两个损失一个要求未激活，一个要求激活过的。
             # EMCAD的dice损失则要求未激活的。
             train_dice_loss += loss.item()
@@ -189,14 +223,26 @@ def trainModel(model, train_loader, val_loader, lr, num_epochs,
         with torch.no_grad():
             for images, true_masks in val_loader:
                 images, true_masks = images.to(device), true_masks.to(device)
-                pred_masks = model(images)
+                pred_main, pred_aux, att = model(images)
                 # pred_binary = torch.where(torch.sigmoid(pred_masks) > 0.5, 1.0, 0.0)
-                pred_binary = (torch.sigmoid(pred_masks) > 0.5).float()
+                pred_binary = (torch.sigmoid(pred_main) > 0.5).float()
 
                 # 这里的model输出的是未经过sigmoid的。
-                bce_loss = criterion(pred_masks, true_masks)  # BCE 或 CrossEntropy 损失
-                dice_loss = calculateDiceLoss(torch.sigmoid(pred_masks), true_masks)  # Dice 损失
-                loss = weight_bce * bce_loss + weight_dice * dice_loss
+                bce_main = criterion(pred_main, true_masks)
+                dice_main = calculateDiceLoss(torch.sigmoid(pred_main), true_masks)
+
+                bce_aux = criterion(pred_aux, true_masks)
+                dice_aux = calculateDiceLoss(torch.sigmoid(pred_aux), true_masks)
+                with torch.no_grad():
+                    # gt_np = true_masks.detach().cpu().numpy()
+                    gt_np = true_masks.squeeze(1).detach().cpu().numpy()
+                    gt_bnd_np = get_gt_boundary_np(gt_np, radius=2)
+                val_gt_bnd = torch.from_numpy(gt_bnd_np).float().unsqueeze(1).to(true_masks.device)
+
+                # 使用 BCE 或 Dice 损失监督边界注意力图
+                edge_loss = F.binary_cross_entropy(att, val_gt_bnd)
+
+                loss = (0.7 * bce_main + 0.3 * dice_main) + 0.4 * (0.7 * bce_aux + 0.3 * dice_aux) + 0.1 * edge_loss
 
                 val_dice_loss += loss.item()
                 # 这里的也经过了正确的调整。
@@ -250,12 +296,7 @@ def trainModel(model, train_loader, val_loader, lr, num_epochs,
     state_dict = model.state_dict()
 
     # 保存最后的模型
-    # torch.save(state_dict, str(dir_checkpoint / f'checkpoint_fold{fold}_epoch{epoch}.pth'))
-    # new_filename = f'new_model_fold{fold}_epoch{best_epoch}.pth'
 
-    # torch.save(state_dict, f'./{new_filename}')
-
-    # logging.info(f'Checkpoint for fold {fold}, epoch {epoch} saved!')
 
     filename = f'best_TRANSFORMER-aauNET_fold{fold}_epoch{best_epoch}.pth'
     torch.save(best_model, f'./{filename}')
@@ -280,7 +321,8 @@ def trainModel(model, train_loader, val_loader, lr, num_epochs,
             if true_masks.dim() == 3:
                 true_masks = true_masks.unsqueeze(1)
 
-            pred_masks = model(images)
+            pred_masks, aux, att = model(images)
+
             pred_binary = (torch.sigmoid(pred_masks) > 0.5).float()
 
             jaccard_total += calculateJaccard(pred_binary, true_masks)
@@ -319,40 +361,18 @@ class AugmentedSubset(Dataset):
     def __getitem__(self, idx):
         image, mask = self.subset[idx]  # 图像和掩码已是张量
         # print(f"Type of image_aug: {type(image)}")
-        # print(f"Image tensor dtype: {image.dtype}")
-        # 打印原始张量的唯一值和统计信息
-        # print(f"原始张量 mask tensor (idx={idx}):")
-        # print(f" 原始张量 Unique values: {torch.unique(mask)}")
-        # print(f" 原始张量 Min value: {mask.min().item()}")
-        # print(f" 原始张量 Max value: {mask.max().item()}")
-        # print(f" 原始张量 Mean value: {mask.float().mean().item()}")
-        # 将张量还原为 PIL 图像
+
         image_pil = to_pil_image(image)
         mask_pil = to_pil_image(mask)
         # 打印 PIL 图像的唯一值和统计信息
-        # print(f"\nPIL mask image (idx={idx}):")
-        # mask_pil_np = np.array(mask_pil)
-        # print(f" PIL Unique values: {np.unique(mask_pil)}")
-        # print(f" PIL Min value: {mask_pil_np.min()}")
-        # print(f" PIL Max value: {mask_pil_np.max()}")
-        # print(f"  PIL Mean value: {mask_pil_np.mean()}")
-        # 转换为 numpy 格式以进行增强
+
         image_np = np.array(image_pil)
         mask_np = np.array(mask_pil)
-        # 打印原始掩码的唯一值和统计信息
-        # print(f"Original mask unique values: {np.unique(mask_np)}")
-        # print(f"Original mask min: {mask_np.min()}, max: {mask_np.max()}")
-        # 应用增强
+
         augmented = self.transform(image=image_np, mask=mask_np)
         # 转换回张量
         image_aug = augmented['image']
         mask_aug = augmented['mask']
-        # 检查 image_aug 和 mask_aug 的类型
-        # print(f"Type of image_aug: {type(image_aug)}")
-        # print(f"Type of mask_aug: {type(mask_aug)}")
-        # # 打印增强后掩码的唯一值和统计信息（在归一化之前）
-        # print(f"Augmented mask (before normalization) unique values: {np.unique(mask_aug)}")
-        # print(f"Augmented mask (before normalization) min: {mask_aug.min()}, max: {mask_aug.max()}")
 
         image_aug = image_aug.float() / 255.0
         mask_aug = mask_aug.float() / 255.0
@@ -385,15 +405,6 @@ def cross_validation(args, Train_val_dataset, k_folds=5):
         train_loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True)
         val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False)
 
-        # # Define data loaders for training and validation data in this fold
-        # # train_subsampler = torch.utils.data.SubsetRandomSampler(train_ids)
-        # train_subsampler = train_transform(torch.utils.data.SubsetRandomSampler(train_ids))
-        # val_subsampler = torch.utils.data.SubsetRandomSampler(val_ids)
-        #
-        # train_loader = torch.utils.data.DataLoader(
-        #     Train_val_dataset, batch_size=args.batch_size, sampler=train_subsampler)
-        # val_loader = torch.utils.data.DataLoader(
-        #     Train_val_dataset, batch_size=args.batch_size, sampler=val_subsampler)
 
         # Train the model on this fold
         best_model, best_dice, best_epoch, train_loss_history, val_loss_history, train_score_history, val_score_history = trainModel(
@@ -410,7 +421,7 @@ def cross_validation(args, Train_val_dataset, k_folds=5):
             'val_score_history': val_score_history
         })
     # 这里讲的是每一折的情况，而不是具体的汇报每一代的情况。但是val_loss_history可以记录每一代的情况。
-    # Calculate and print the average and standard deviation of the metrics
+
 
     return fold_metrics
 
@@ -478,9 +489,4 @@ if __name__ == '__main__':
     os.makedirs('./', exist_ok=True)
     with open('./cv_history.json', 'w') as f:
         json.dump(The_fold_metrics, f, indent=4)
-
-
-    # Change here to adapt to your data
-    # n_channels=1 for Grayscale images
-    # n_classes is the number of probabilities you want to get per pixel
 
